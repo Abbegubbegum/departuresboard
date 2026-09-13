@@ -4,6 +4,7 @@
 #include <HTTPClient.h>
 #include <base64.h>
 #include <ArduinoJson.h>
+#include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 
 // HUB75 matrix setup is on hold while we get the Vasttrafik API working -
 // see git history for the pin mapping / MatrixPanel_I2S_DMA init.
@@ -15,7 +16,43 @@ String accessToken;
 unsigned long tokenExpiresAtMs = 0;
 
 unsigned long lastFetchMs = 0;
-const unsigned long FETCH_INTERVAL_MS = 30000;
+constexpr unsigned long FETCH_INTERVAL_MS = 30000;
+
+#define PANEL_RES_X 64
+#define PANEL_RES_Y 32
+#define PANEL_CHAIN 1
+
+// Pin mapping chosen to avoid ESP32-S3 flash/PSRAM/strapping/USB pins.
+// Wire the HUB75 connector to match these GPIOs (or tell me your board's
+// fixed adapter pinout if you're using a breakout).
+#define R1_PIN 4
+#define G1_PIN 6
+#define B1_PIN 5
+#define R2_PIN 7
+#define G2_PIN 16
+#define B2_PIN 15
+#define A_PIN 18
+#define B_PIN 8
+#define C_PIN 9
+#define D_PIN 10
+#define E_PIN -1 // needed if panel is 1/32 scan
+#define LAT_PIN 12
+#define OE_PIN 13
+#define CLK_PIN 11
+
+MatrixPanel_I2S_DMA *display = nullptr;
+
+struct Departure
+{
+  String line;
+  String destination;
+  time_t departure_time;
+};
+
+Departure departure_array[4];
+
+constexpr unsigned long RENDER_INTERVAL_MS = 1000;
+unsigned long lastRenderMs = 0;
 
 void connectWiFi()
 {
@@ -155,6 +192,25 @@ void lookupStopId()
   Serial.println("Copy the gid you want into VASTTRAFIK_STOP_ID in .env, then re-upload.");
 }
 
+time_t parseISOString(const char *time_string)
+{
+  tm time;
+
+  int year, mon;
+
+  int result = sscanf(time_string, "%4d-%2d-%2dT%2d:%2d:%2d", &year, &mon, &time.tm_mday, &time.tm_hour, &time.tm_min, &time.tm_sec);
+
+  if (result != 6)
+  {
+    Serial.println("Date String Parse FAILURE");
+  }
+
+  time.tm_year = year - 1900;
+  time.tm_mon = mon - 1;
+
+  return mktime(&time);
+}
+
 void fetchDepartures()
 {
   if (!ensureAccessToken())
@@ -195,6 +251,8 @@ void fetchDepartures()
 
   JsonArray results = doc["results"].as<JsonArray>();
   Serial.printf("---- %u departures ----\n", results.size());
+
+  size_t i = 0;
   for (JsonObject dep : results)
   {
     JsonObject serviceJourney = dep["serviceJourney"];
@@ -204,9 +262,51 @@ void fetchDepartures()
     const char *estimatedTime = dep["estimatedTime"] | plannedTime;
     bool cancelled = dep["isCancelled"] | false;
 
-    Serial.printf("Line %-4s -> %-25s planned %s estimated %s%s\n",
-                  line, direction, plannedTime, estimatedTime,
-                  cancelled ? " [CANCELLED]" : "");
+    // Serial.printf("%d. Line %-4s -> %-25s planned %s estimated %s%s\n", i,
+    //               line, direction, plannedTime, estimatedTime,
+    //               cancelled ? " [CANCELLED]" : "");
+
+    if (i < 4)
+    {
+      Departure departure;
+
+      departure.line = String(serviceJourney["line"]["shortName"] | "?");
+      departure.destination = String(serviceJourney["directionDetails"]["shortDirection"] | "?");
+
+      const char *departure_time = dep["estimatedTime"] | dep["plannedTime"] | "?";
+
+      departure.departure_time = parseISOString(departure_time);
+
+      departure_array[i] = departure;
+    }
+
+    i++;
+  }
+}
+
+time_t getCurrentTimeEpoch()
+{
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo))
+  {
+    Serial.println("  Failed to obtain time");
+    return 0;
+  }
+
+  return mktime(&timeinfo);
+}
+
+void renderDisplay()
+{
+  display->clearScreen();
+
+  display->setCursor(0, 0);
+  for (int i = 0; i < 4; i++)
+  {
+    Departure departure = departure_array[i];
+
+    display->printf("%s %.9s\n", departure.line, departure.destination);
+    Serial.printf("%s %.9s\n", departure.line, departure.destination);
   }
 }
 
@@ -221,6 +321,34 @@ void setup()
   {
     lookupStopId();
   }
+
+  HUB75_I2S_CFG::i2s_pins pins = {
+      R1_PIN, G1_PIN, B1_PIN, R2_PIN, G2_PIN, B2_PIN,
+      A_PIN, B_PIN, C_PIN, D_PIN, E_PIN,
+      LAT_PIN, OE_PIN, CLK_PIN};
+
+  HUB75_I2S_CFG mxconfig(
+      PANEL_RES_X,
+      PANEL_RES_Y,
+      PANEL_CHAIN, pins);
+
+  display = new MatrixPanel_I2S_DMA(mxconfig);
+  display->begin();
+  display->setBrightness8(90);
+  display->clearScreen();
+
+  configTime(0, 0, "pool.ntp.org");
+  // Timezone for Stockholm, Sweden
+  setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
+  tzset();
+
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo))
+  {
+    Serial.println("  Failed to obtain time");
+    return;
+  }
+  Serial.printf("Got time %i:%i:%i\n", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
 }
 
 void loop()
@@ -240,5 +368,11 @@ void loop()
   {
     lastFetchMs = millis();
     fetchDepartures();
+  }
+
+  if (lastRenderMs == 0 || millis() - lastRenderMs >= RENDER_INTERVAL_MS)
+  {
+    lastRenderMs = millis();
+    renderDisplay();
   }
 }
