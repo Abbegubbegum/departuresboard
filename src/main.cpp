@@ -22,6 +22,8 @@ constexpr unsigned long FETCH_INTERVAL_MS = 30000;
 #define PANEL_RES_Y 32
 #define PANEL_CHAIN 1
 
+constexpr unsigned int MAX_CHARS_PER_ROW = PANEL_RES_X / 6;
+
 // Pin mapping chosen to avoid ESP32-S3 flash/PSRAM/strapping/USB pins.
 // Wire the HUB75 connector to match these GPIOs (or tell me your board's
 // fixed adapter pinout if you're using a breakout).
@@ -35,7 +37,7 @@ constexpr unsigned long FETCH_INTERVAL_MS = 30000;
 #define B_PIN 8
 #define C_PIN 9
 #define D_PIN 10
-#define E_PIN -1 // needed if panel is 1/32 scan
+#define E_PIN 17 // needed if panel is 1/32 scan
 #define LAT_PIN 12
 #define OE_PIN 13
 #define CLK_PIN 11
@@ -261,10 +263,11 @@ void fetchDepartures()
     const char *plannedTime = dep["plannedTime"] | "?";
     const char *estimatedTime = dep["estimatedTime"] | plannedTime;
     bool cancelled = dep["isCancelled"] | false;
+    const char *shortDirection = serviceJourney["directionDetails"]["shortDirection"] | "?";
 
-    // Serial.printf("%d. Line %-4s -> %-25s planned %s estimated %s%s\n", i,
-    //               line, direction, plannedTime, estimatedTime,
-    //               cancelled ? " [CANCELLED]" : "");
+    Serial.printf("%d. Line %-4s -> %s planned %s estimated %s%s\n", i,
+                  line, shortDirection, plannedTime, estimatedTime,
+                  cancelled ? " [CANCELLED]" : "");
 
     if (i < 4)
     {
@@ -305,17 +308,21 @@ void renderDisplay()
   {
     Departure departure = departure_array[i];
 
-    display->printf("%s %.9s\n", departure.line, departure.destination);
-    Serial.printf("%s %.9s\n", departure.line, departure.destination);
+    String print_line = String(departure.line + " " + departure.destination);
+
+    display->println(print_line.substring(0, MAX_CHARS_PER_ROW).c_str());
   }
+
+  display->flipDMABuffer();
 }
 
 void setup()
 {
   Serial.begin(115200);
-  delay(1000);
 
   connectWiFi();
+  WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_POWER_11dBm); // lower peak TX current draw; try removing if flicker persists and check the panel's power supply instead
 
   if (String(VASTTRAFIK_STOP_ID).length() == 0)
   {
@@ -332,10 +339,14 @@ void setup()
       PANEL_RES_Y,
       PANEL_CHAIN, pins);
 
+  mxconfig.double_buff = true;
+  mxconfig.clkphase = false;
+
   display = new MatrixPanel_I2S_DMA(mxconfig);
   display->begin();
-  display->setBrightness8(90);
+  display->setBrightness8(20);
   display->clearScreen();
+  display->setTextWrap(false);
 
   configTime(0, 0, "pool.ntp.org");
   // Timezone for Stockholm, Sweden
